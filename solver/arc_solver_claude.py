@@ -348,7 +348,7 @@ HYPOTHESIS 1: [operator]
 MDL: [cost]
 Support: [count]/[total]
 
-Propose 3-5 hypotheses from simplest to most complex."""
+Propose 10-15 hypotheses from simplest to most complex."""
 
     def _build_prompt(self, examples: List[Dict], analysis: Dict) -> str:
         """Build user prompt with examples."""
