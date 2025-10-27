@@ -1,73 +1,25 @@
 #!/usr/bin/env python3
 """
-Living Map ARC-AGI Solver - Final Compact Version
+Living Map ARC-AGI Solver - Improved Version
 
-Core principle: Find the SHORTEST program that explains all training examples.
-Score = MDL / support (minimize: prefer simple rules that work well)
+Fixes:
+1. Better operator parsing from LLM responses
+2. Fallback to exhaustive search of primitives
+3. LLM code generation when primitives fail
+4. Proper comparison logic for grid matching
 """
 
 import json
 import argparse
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from openai import OpenAI
 
 # ============================================================================
 # DATA STRUCTURES
 # ============================================================================
-
-@dataclass
-class Object:
-    """A connected component in a grid."""
-    color: int
-    pixels: List[Tuple[int, int]]
-
-    @property
-    def bbox(self) -> Tuple[int, int, int, int]:
-        rows, cols = zip(*self.pixels)
-        return (min(rows), min(cols), max(rows), max(cols))
-
-@dataclass
-class ObjectGraph:
-    """Structured representation of a grid."""
-    objects: List[Object]
-
-    def __init__(self, grid: np.ndarray):
-        self.objects = self._extract_objects(grid)
-
-    def _extract_objects(self, grid: np.ndarray) -> List[Object]:
-        """Extract connected components."""
-        objects = []
-        seen = set()
-        h, w = grid.shape
-
-        for r in range(h):
-            for c in range(w):
-                if (r, c) in seen or grid[r, c] == 0:
-                    continue
-
-                # BFS to find connected component
-                color = grid[r, c]
-                pixels = []
-                queue = [(r, c)]
-                seen.add((r, c))
-
-                while queue:
-                    cr, cc = queue.pop(0)
-                    pixels.append((cr, cc))
-
-                    for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
-                        nr, nc = cr + dr, cc + dc
-                        if (0 <= nr < h and 0 <= nc < w and
-                            (nr, nc) not in seen and grid[nr, nc] == color):
-                            queue.append((nr, nc))
-                            seen.add((nr, nc))
-
-                objects.append(Object(color, pixels))
-
-        return objects
 
 @dataclass
 class PrimitiveOp:
@@ -88,6 +40,8 @@ class PrimitiveOp:
         'gravity_left': 1.5,
         'gravity_right': 1.5,
         'tile_pattern': 2.5,
+        'transpose': 1.0,
+        'llm_code': 5.0,  # High cost for LLM-generated code
     }
 
     def cost(self) -> float:
@@ -104,22 +58,18 @@ class Hypothesis:
     """A transformation hypothesis with support validation."""
     program: PrimitiveOp
     support: float = 0.0
+    code: Optional[str] = None  # For LLM-generated code
 
     def mdl(self) -> float:
         """Minimum Description Length in bits."""
         return self.program.cost()
 
     def score(self) -> float:
-        """Score = MDL / support (minimize: lower is better).
-
-        Interpretation: bits per explained example
-        - Low MDL + High support → Low score (BEST)
-        - High MDL or Low support → High score (WORSE)
-        """
+        """Score = MDL / support (minimize: lower is better)."""
         return float('inf') if self.support == 0 else self.mdl() / self.support
 
 # ============================================================================
-# SYMBOLIC EXECUTION (0 bits)
+# SYMBOLIC EXECUTION
 # ============================================================================
 
 class SymbolicExecutor:
@@ -127,56 +77,36 @@ class SymbolicExecutor:
 
     @staticmethod
     def execute(op_name: str, grid: List[List[int]]) -> Optional[List[List[int]]]:
-        """Execute operator symbolically. Returns None if not available."""
+        """Execute operator symbolically."""
         arr = np.array(grid)
 
-        if op_name == 'identity':
-            return grid
+        ops = {
+            'identity': lambda: grid,
+            'tile_pattern': lambda: SymbolicExecutor._tile_3x3(arr),
+            'reflect_vertical': lambda: arr[::-1].tolist(),
+            'reflect_horizontal': lambda: arr[:, ::-1].tolist(),
+            'rotate_90': lambda: np.rot90(arr, k=-1).tolist(),
+            'rotate_180': lambda: np.rot90(arr, k=2).tolist(),
+            'rotate_270': lambda: np.rot90(arr, k=1).tolist(),
+            'transpose': lambda: arr.T.tolist(),
+            'gravity_down': lambda: SymbolicExecutor._gravity(arr, 'down'),
+            'gravity_up': lambda: SymbolicExecutor._gravity(arr, 'up'),
+            'gravity_left': lambda: SymbolicExecutor._gravity(arr, 'left'),
+            'gravity_right': lambda: SymbolicExecutor._gravity(arr, 'right'),
+        }
 
-        elif op_name == 'tile_pattern':
-            return SymbolicExecutor._tile_3x3(arr)
-
-        elif op_name == 'reflect_vertical':
-            return grid[::-1]
-
-        elif op_name == 'reflect_horizontal':
-            return [row[::-1] for row in grid]
-
-        elif op_name == 'rotate_90':
-            return np.rot90(arr, k=-1).tolist()
-
-        elif op_name == 'rotate_180':
-            return np.rot90(arr, k=2).tolist()
-
-        elif op_name == 'rotate_270':
-            return np.rot90(arr, k=1).tolist()
-
-        elif op_name == 'gravity_down':
-            return SymbolicExecutor._gravity(arr, 'down')
-
-        elif op_name == 'gravity_up':
-            return SymbolicExecutor._gravity(arr, 'up')
-
-        elif op_name == 'gravity_left':
-            return SymbolicExecutor._gravity(arr, 'left')
-
-        elif op_name == 'gravity_right':
-            return SymbolicExecutor._gravity(arr, 'right')
-
-        return None
+        return ops.get(op_name, lambda: None)()
 
     @staticmethod
     def _tile_3x3(arr: np.ndarray) -> List[List[int]]:
         """Tile 3x3 with alternating horizontal flips."""
         output = []
-
         for block_idx in range(3):
             for row in arr:
                 if block_idx % 2 == 0:
                     output.append(np.tile(row, 3).tolist())
                 else:
                     output.append(np.tile(row[::-1], 3).tolist())
-
         return output
 
     @staticmethod
@@ -190,19 +120,16 @@ class SymbolicExecutor:
                 non_zero = [arr[row, col] for row in range(h) if arr[row, col] != 0]
                 for i, val in enumerate(non_zero):
                     output[h - len(non_zero) + i, col] = val
-
         elif direction == 'up':
             for col in range(w):
                 non_zero = [arr[row, col] for row in range(h) if arr[row, col] != 0]
                 for i, val in enumerate(non_zero):
                     output[i, col] = val
-
         elif direction == 'left':
             for row in range(h):
                 non_zero = [arr[row, col] for col in range(w) if arr[row, col] != 0]
                 for i, val in enumerate(non_zero):
                     output[row, i] = val
-
         elif direction == 'right':
             for row in range(h):
                 non_zero = [arr[row, col] for col in range(w) if arr[row, col] != 0]
@@ -229,17 +156,29 @@ class LivingMapSolver:
         if self.verbose:
             print(f"  Training examples: {len(task['train'])}")
 
-        # Analyze training data
-        analysis = self._analyze_examples(task['train'])
+        # First, try all primitive operators exhaustively
+        hypotheses = self._try_all_primitives(task['train'])
 
-        # Generate hypotheses
-        hypotheses = self._generate_hypotheses(task['train'], analysis)
+        # If no primitive works, use LLM to generate hypotheses
+        if all(h.support == 0 for h in hypotheses):
+            if self.verbose:
+                print(f"  No primitive worked, consulting LLM...")
+            analysis = self._analyze_examples(task['train'])
+            llm_hypotheses = self._generate_llm_hypotheses(task['train'], analysis)
+            hypotheses.extend(llm_hypotheses)
 
         # Select best by score
-        best_hyp = min(hypotheses, key=lambda h: h.score())
+        valid_hypotheses = [h for h in hypotheses if h.support > 0]
+        if not valid_hypotheses:
+            if self.verbose:
+                print(f"  WARNING: No valid hypotheses found!")
+            best_hyp = hypotheses[0]  # Default to identity
+        else:
+            best_hyp = min(valid_hypotheses, key=lambda h: h.score())
 
         if self.verbose:
-            print(f"  Best: {best_hyp.program.describe()} (score={best_hyp.score():.2f})")
+            print(f"  Best: {best_hyp.program.describe()} "
+                  f"(support={best_hyp.support}, score={best_hyp.score():.2f})")
 
         # Apply to test
         test_input = task['test'][0]['input']
@@ -254,139 +193,120 @@ class LivingMapSolver:
             'bits_spent': self.bits_spent
         }
 
+    def _try_all_primitives(self, examples: List[Dict]) -> List[Hypothesis]:
+        """Try all primitive operators systematically."""
+        all_ops = [
+            'identity', 'tile_pattern', 'reflect_vertical', 'reflect_horizontal',
+            'rotate_90', 'rotate_180', 'rotate_270', 'transpose',
+            'gravity_down', 'gravity_up', 'gravity_left', 'gravity_right'
+        ]
+
+        hypotheses = []
+        for op_name in all_ops:
+            h = Hypothesis(PrimitiveOp(op_name))
+            h.support = self._compute_support(h, examples)
+            hypotheses.append(h)
+
+            if self.verbose and h.support > 0:
+                print(f"  ✓ {op_name}: support={h.support}/{len(examples)}, "
+                      f"score={h.score():.2f}")
+
+        return hypotheses
+
     def _analyze_examples(self, examples: List[Dict]) -> Dict:
         """Quick analysis of training examples."""
-        analysis = {
-            'shape_changes': [],
-            'colors': set()
-        }
+        analysis = {'examples_summary': []}
 
-        for ex in examples:
-            in_shape = np.array(ex['input']).shape
-            out_shape = np.array(ex['output']).shape
-            analysis['shape_changes'].append({
-                'in': in_shape,
-                'out': out_shape,
-                'scaled': out_shape[0] % in_shape[0] == 0 if in_shape[0] > 0 else False
+        for i, ex in enumerate(examples):
+            in_arr = np.array(ex['input'])
+            out_arr = np.array(ex['output'])
+            analysis['examples_summary'].append({
+                'index': i,
+                'in_shape': in_arr.shape,
+                'out_shape': out_arr.shape,
+                'in_colors': set(in_arr.flatten().tolist()) - {0},
+                'out_colors': set(out_arr.flatten().tolist()) - {0}
             })
-            analysis['colors'].update(np.unique(ex['input']))
-            analysis['colors'].update(np.unique(ex['output']))
 
         return analysis
 
-    def _generate_hypotheses(self, examples: List[Dict], analysis: Dict) -> List[Hypothesis]:
-        """Generate and validate hypotheses."""
+    def _generate_llm_hypotheses(self, examples: List[Dict], analysis: Dict) -> List[Hypothesis]:
+        """Use LLM to generate code-based hypotheses."""
         if self.verbose:
-            print(f"  Calling LLM for hypotheses...")
+            print(f"  Requesting LLM code generation...")
 
-        # Build prompt
-        prompt = self._build_prompt(examples, analysis)
+        prompt = self._build_code_gen_prompt(examples, analysis)
 
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self._system_prompt()},
+                    {"role": "system", "content": self._code_gen_system_prompt()},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.5,
-                max_tokens=1000
+                temperature=0.3,
+                max_tokens=2000
             )
 
-            self.bits_spent += 1
+            self.bits_spent += 5  # High cost for LLM code generation
 
-            # Parse LLM response
-            hypotheses = self._parse_hypotheses(response.choices[0].message.content)
-
-            # Validate support
-            for h in hypotheses:
+            code = self._extract_code(response.choices[0].message.content)
+            if code:
+                h = Hypothesis(PrimitiveOp('llm_code'), code=code)
                 h.support = self._compute_support(h, examples)
-
-            if self.verbose:
-                print(f"  Validated {len(hypotheses)} hypotheses")
-
-            return hypotheses
+                if self.verbose:
+                    print(f"  LLM code: support={h.support}/{len(examples)}")
+                return [h]
 
         except Exception as e:
-            print(f"Error generating hypotheses: {e}")
-            return [Hypothesis(PrimitiveOp('identity'), len(examples))]
+            print(f"  Error in LLM code generation: {e}")
 
-    def _system_prompt(self) -> str:
-        """System prompt for hypothesis generation."""
-        return """You are an ARC-AGI solver. Propose transformation rules using these operators:
+        return []
 
-OPERATORS (bits):
-- identity (0.5) - no change
-- tile_pattern (2.5) - tile 3x3 with flips
-- color_map (1.5) - remap colors
-- reflect_vertical/horizontal (1.0) - flip
-- rotate_90/180/270 (1.0) - rotate
-- gravity_down/up/left/right (1.5) - objects fall
+    def _code_gen_system_prompt(self) -> str:
+        """System prompt for code generation."""
+        return """You are an ARC-AGI solver. Generate a Python function that transforms the input grid to the output grid.
 
-OUTPUT FORMAT (exactly):
-HYPOTHESIS 1: [operator]
-MDL: [cost]
-Support: [count]/[total]
+Requirements:
+- Function signature: def transform(grid: List[List[int]]) -> List[List[int]]:
+- Input/output are 2D lists of integers
+- Use numpy if needed (import as np)
+- Be concise and efficient
+- Only return the function, no explanation"""
 
-Propose 5-10 hypotheses from simplest to most complex."""
-
-    def _build_prompt(self, examples: List[Dict], analysis: Dict) -> str:
-        """Build user prompt with examples."""
-        prompt = f"Analyze these {len(examples)} examples and propose transformation rules.\n\n"
+    def _build_code_gen_prompt(self, examples: List[Dict], analysis: Dict) -> str:
+        """Build prompt for code generation."""
+        prompt = "Generate a transform function for these examples:\n\n"
 
         for i, ex in enumerate(examples[:2], 1):
             in_arr = np.array(ex['input'])
             out_arr = np.array(ex['output'])
             prompt += f"Example {i}:\n"
-            prompt += f"  Input: {in_arr.shape}, colors: {set(in_arr.flatten()) - {0}}\n"
-            prompt += f"  Output: {out_arr.shape}, colors: {set(out_arr.flatten()) - {0}}\n\n"
-
-        if analysis['shape_changes'] and analysis['shape_changes'][0]['scaled']:
-            prompt += "Note: Output is scaled/tiled from input.\n"
+            prompt += f"Input ({in_arr.shape}):\n{in_arr.tolist()}\n"
+            prompt += f"Output ({out_arr.shape}):\n{out_arr.tolist()}\n\n"
 
         return prompt
 
-    def _parse_hypotheses(self, response: str) -> List[Hypothesis]:
-        """Parse LLM response into hypotheses."""
-        hypotheses = []
-        lines = response.split('\n')
-
-        for line in lines:
-            line = line.strip()
-
-            if line.upper().startswith('HYPOTHESIS'):
-                if ':' in line:
-                    current_desc = line.split(':', 1)[1].strip().lower()
-
-                    # Map to known operators
-                    if 'tile' in current_desc:
-                        op = PrimitiveOp('tile_pattern', {'n_rows': 3, 'n_cols': 3})
-                    elif 'reflect' in current_desc and 'vertical' in current_desc:
-                        op = PrimitiveOp('reflect_vertical')
-                    elif 'reflect' in current_desc and 'horizontal' in current_desc:
-                        op = PrimitiveOp('reflect_horizontal')
-                    elif 'rotate_90' in current_desc:
-                        op = PrimitiveOp('rotate_90')
-                    elif 'rotate_180' in current_desc:
-                        op = PrimitiveOp('rotate_180')
-                    elif 'rotate_270' in current_desc:
-                        op = PrimitiveOp('rotate_270')
-                    elif 'gravity' in current_desc and 'down' in current_desc:
-                        op = PrimitiveOp('gravity_down')
-                    elif 'gravity' in current_desc and 'up' in current_desc:
-                        op = PrimitiveOp('gravity_up')
-                    elif 'gravity' in current_desc and 'left' in current_desc:
-                        op = PrimitiveOp('gravity_left')
-                    elif 'gravity' in current_desc and 'right' in current_desc:
-                        op = PrimitiveOp('gravity_right')
-                    elif 'color' in current_desc or 'map' in current_desc:
-                        op = PrimitiveOp('color_map')
-                    else:
-                        op = PrimitiveOp('identity')
-
-                    hypotheses.append(Hypothesis(op))
-
-        return hypotheses if hypotheses else [Hypothesis(PrimitiveOp('identity'))]
+    def _extract_code(self, response: str) -> Optional[str]:
+        """Extract Python code from LLM response."""
+        # Look for code blocks
+        if '```python' in response:
+            start = response.find('```python') + 9
+            end = response.find('```', start)
+            return response[start:end].strip()
+        elif 'def transform' in response:
+            # Try to extract function directly
+            lines = []
+            in_function = False
+            for line in response.split('\n'):
+                if 'def transform' in line:
+                    in_function = True
+                if in_function:
+                    lines.append(line)
+                    if line and not line[0].isspace() and 'def transform' not in line:
+                        break
+            return '\n'.join(lines).strip()
+        return None
 
     def _compute_support(self, hypothesis: Hypothesis, examples: List[Dict]) -> float:
         """Compute actual support by validation."""
@@ -395,30 +315,46 @@ Propose 5-10 hypotheses from simplest to most complex."""
         for ex in examples:
             try:
                 prediction = self._execute(hypothesis, ex['input'])
-                if prediction == ex['output']:
+                expected = ex['output']
+
+                # Proper comparison handling nested lists and numpy arrays
+                if self._grids_equal(prediction, expected):
                     correct += 1
-            except:
+            except Exception as e:
+                if self.verbose:
+                    print(f"    Error in {hypothesis.program.name}: {e}")
                 continue
 
         return float(correct)
 
-    def _execute(self, hypothesis: Hypothesis, input_grid: List[List[int]]) -> Optional[List[List[int]]]:
-        """Execute hypothesis using symbolic execution."""
-        op_name = hypothesis.program.name
+    def _grids_equal(self, grid1, grid2) -> bool:
+        """Compare two grids for equality."""
+        try:
+            arr1 = np.array(grid1)
+            arr2 = np.array(grid2)
+            return arr1.shape == arr2.shape and np.array_equal(arr1, arr2)
+        except:
+            return grid1 == grid2
 
-        # Try symbolic execution (0 bits)
-        result = SymbolicExecutor.execute(op_name, input_grid)
-
-        if result is not None:
-            if self.verbose:
-                print(f"  ✓ Symbolic execution ({op_name})")
-            return result
-
-        # No symbolic executor available
-        if self.verbose:
-            print(f"  ✗ No symbolic executor for {op_name}")
-
-        return input_grid  # Fallback to identity
+    def _execute(self, hypothesis: Hypothesis, input_grid: List[List[int]]) -> List[List[int]]:
+        """Execute hypothesis."""
+        if hypothesis.code:
+            # Execute LLM-generated code
+            try:
+                namespace = {'np': np, 'List': List}
+                exec(hypothesis.code, namespace)
+                transform = namespace.get('transform')
+                if transform:
+                    result = transform(input_grid)
+                    return result if isinstance(result, list) else result.tolist()
+            except Exception as e:
+                if self.verbose:
+                    print(f"    Error executing LLM code: {e}")
+                return input_grid
+        else:
+            # Try symbolic execution
+            result = SymbolicExecutor.execute(hypothesis.program.name, input_grid)
+            return result if result is not None else input_grid
 
 # ============================================================================
 # MAIN
@@ -431,7 +367,7 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     args = parser.parse_args()
 
-    print(f"Living Map ARC-AGI Solver")
+    print(f"Living Map ARC-AGI Solver - Improved")
     print(f"Model: {args.model}")
     print(f"Directory: {args.directory}\n")
 
@@ -455,7 +391,7 @@ def main():
 
         # Check correctness
         expected = task['test'][0].get('output')
-        is_correct = result['prediction'] == expected if expected else None
+        is_correct = solver._grids_equal(result['prediction'], expected) if expected else None
         result['correct'] = is_correct
 
         if is_correct:
