@@ -168,7 +168,6 @@ class SymbolicExecutor:
     @staticmethod
     def _tile_3x3(arr: np.ndarray) -> List[List[int]]:
         """Tile 3x3 with alternating horizontal flips."""
-        h, w = arr.shape
         output = []
 
         for block_idx in range(3):
@@ -226,60 +225,41 @@ class LivingMapSolver:
         self.bits_spent = 0
 
     def solve_task(self, task: Dict) -> Dict:
-        """Main solving pipeline."""
+        """Solve a single ARC task."""
         if self.verbose:
-            print(f"\n{'='*60}\nSOLVING TASK\n{'='*60}")
+            print(f"  Training examples: {len(task['train'])}")
 
-        # Phase 1: Typed Perception
-        train_examples = task['train']
+        # Analyze training data
+        analysis = self._analyze_examples(task['train'])
+
+        # Generate hypotheses
+        hypotheses = self._generate_hypotheses(task['train'], analysis)
+
+        # Select best by score
+        best_hyp = min(hypotheses, key=lambda h: h.score())
+
+        if self.verbose:
+            print(f"  Best: {best_hyp.program.describe()} (score={best_hyp.score():.2f})")
+
+        # Apply to test
         test_input = task['test'][0]['input']
-
-        if self.verbose:
-            print(f"Phase 1: Typed Perception")
-            print(f"  Training examples: {len(train_examples)}")
-
-        # Phase 2: Structural Analysis
-        analysis = self._analyze_structure(train_examples)
-
-        if self.verbose:
-            print(f"\nPhase 2: Structural Analysis")
-            print(f"  Shape changes: {analysis['shape_changes']}")
-
-        # Phase 3: Generate Hypotheses
-        hypotheses = self._generate_hypotheses(train_examples, analysis)
-
-        if self.verbose:
-            print(f"\nPhase 3: Generated {len(hypotheses)} hypotheses")
-            for i, h in enumerate(hypotheses, 1):
-                print(f"  {i}. {h.program.describe()}: MDL={h.mdl():.1f}, "
-                      f"Support={h.support:.1f}, Score={h.score():.2f}")
-
-        # Phase 4: Select Best
-        best = min(hypotheses, key=lambda h: h.score()) if hypotheses else None
-
-        if self.verbose and best:
-            print(f"\nPhase 4: Best hypothesis: {best.program.describe()}")
-            print(f"  Score: {best.score():.2f}")
-
-        # Phase 5: Execute
-        prediction = self._execute(best, test_input) if best else None
-
-        if self.verbose:
-            print(f"\nTotal bits spent: {self.bits_spent}\n{'='*60}")
+        prediction = self._execute(best_hyp, test_input)
 
         return {
+            'hypothesis': best_hyp.program.describe(),
+            'score': best_hyp.score(),
+            'support': best_hyp.support,
+            'mdl': best_hyp.mdl(),
             'prediction': prediction,
-            'hypothesis': best.program.describe() if best else None,
-            'mdl': best.mdl() if best else None,
-            'support': best.support if best else 0,
-            'score': best.score() if best else float('inf'),
-            'bits_spent': self.bits_spent,
-            'num_hypotheses': len(hypotheses),
+            'bits_spent': self.bits_spent
         }
 
-    def _analyze_structure(self, examples: List[Dict]) -> Dict:
-        """Extract structural patterns."""
-        analysis = {'shape_changes': [], 'colors': set()}
+    def _analyze_examples(self, examples: List[Dict]) -> Dict:
+        """Quick analysis of training examples."""
+        analysis = {
+            'shape_changes': [],
+            'colors': set()
+        }
 
         for ex in examples:
             in_shape = np.array(ex['input']).shape
@@ -348,7 +328,7 @@ HYPOTHESIS 1: [operator]
 MDL: [cost]
 Support: [count]/[total]
 
-Propose 10-15 hypotheses from simplest to most complex."""
+Propose 5-10 hypotheses from simplest to most complex."""
 
     def _build_prompt(self, examples: List[Dict], analysis: Dict) -> str:
         """Build user prompt with examples."""
@@ -361,7 +341,7 @@ Propose 10-15 hypotheses from simplest to most complex."""
             prompt += f"  Input: {in_arr.shape}, colors: {set(in_arr.flatten()) - {0}}\n"
             prompt += f"  Output: {out_arr.shape}, colors: {set(out_arr.flatten()) - {0}}\n\n"
 
-        if analysis['shape_changes'][0]['scaled']:
+        if analysis['shape_changes'] and analysis['shape_changes'][0]['scaled']:
             prompt += "Note: Output is scaled/tiled from input.\n"
 
         return prompt
@@ -370,8 +350,6 @@ Propose 10-15 hypotheses from simplest to most complex."""
         """Parse LLM response into hypotheses."""
         hypotheses = []
         lines = response.split('\n')
-
-        current_desc = None
 
         for line in lines:
             line = line.strip()
@@ -495,7 +473,10 @@ def main():
     print(f"{'='*60}")
     print(f"RESULTS")
     print(f"{'='*60}")
-    print(f"Correct: {correct}/{total} ({100*correct/total:.1f}%)")
+    if total > 0:
+        print(f"Correct: {correct}/{total} ({100*correct/total:.1f}%)")
+    else:
+        print(f"Correct: {correct}/{total} (no test outputs available)")
 
     avg_bits = np.mean([r['bits_spent'] for r in results.values()])
     print(f"Average bits: {avg_bits:.1f}")
