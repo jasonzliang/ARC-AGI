@@ -372,7 +372,7 @@ MDL: X.X
 PROGRAM 2: operator2(param=value)
 MDL: Y.Y
 
-Propose 3-5 programs from simplest to slightly more complex."""
+Propose 10-20 programs from simplest to slightly more complex."""
 
     def _format_operators(self) -> str:
         """Format operator list with costs."""
