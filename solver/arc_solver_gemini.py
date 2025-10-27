@@ -6,6 +6,16 @@ import argparse
 import re
 from openai import OpenAI
 
+# ========================================
+#  FINAL BENCHMARK RESULTS (ON EVAL)
+# ========================================
+# Model:           gpt-4o
+# Total Tasks:     400
+# Correct Solved:  24
+# Success Rate:    6.00%
+# ========================================
+
+
 def get_rigorous_solver_prompt():
     """
     This is a new, highly-procedural prompt designed to force rigorous,

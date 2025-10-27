@@ -8,7 +8,10 @@ Implements Living Map principle of "subadditive composition":
 - 3-step compositions (for complex tasks)
 
 MDL principle: Compositions should compress (whole < sum of parts)
+
+Accuracy: 2/400 (0.5%) on eval using gpt-4o
 """
+
 
 import json
 import numpy as np
